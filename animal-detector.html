@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鏡頭動物偵測</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, "Noto Sans TC", sans-serif; background: #111; color: #eee; }
+  header { padding: 12px 16px; font-size: 18px; font-weight: 600; }
+  #stage { position: relative; width: 100%; max-width: 720px; margin: 0 auto; background: #000; aspect-ratio: 4/3; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #controls { max-width: 720px; margin: 0 auto; padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { background: #2e7d32; color: #fff; border: 0; border-radius: 8px; padding: 10px 16px; font-size: 15px; }
+  button.secondary { background: #333; }
+  button:disabled { opacity: .5; }
+  label { font-size: 14px; display: flex; align-items: center; gap: 6px; }
+  #status { max-width: 720px; margin: 0 auto; padding: 0 16px 8px; font-size: 14px; color: #9ad; min-height: 1.4em; }
+  #list { max-width: 720px; margin: 0 auto; padding: 0 16px 24px; font-size: 16px; }
+</style>
+</head>
+<body>
+<header>🐾 鏡頭動物偵測</header>
+
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="controls">
+  <button id="startBtn">開啟鏡頭</button>
+  <button id="flipBtn" class="secondary" disabled>切換前後鏡頭</button>
+  <label>信心門檻
+    <input id="thr" type="range" min="0.3" max="0.9" step="0.05" value="0.5">
+    <span id="thrVal">50%</span>
+  </label>
+  <label><input id="onlyAnimals" type="checkbox" checked> 只顯示動物</label>
+</div>
+<div id="status">按「開啟鏡頭」開始（首次需載入模型）</div>
+<div id="list"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const ANIMALS = {
+  bird: "鳥", cat: "貓", dog: "狗", horse: "馬", sheep: "羊",
+  cow: "牛", elephant: "大象", bear: "熊", zebra: "斑馬", giraffe: "長頸鹿"
+};
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const listEl = document.getElementById("list");
+const startBtn = document.getElementById("startBtn");
+const flipBtn = document.getElementById("flipBtn");
+const thr = document.getElementById("thr");
+const thrVal = document.getElementById("thrVal");
+const onlyAnimals = document.getElementById("onlyAnimals");
+
+let model = null, stream = null, facing = "environment", running = false;
+
+thr.addEventListener("input", () => thrVal.textContent = Math.round(thr.value * 100) + "%");
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+  } catch (e) {
+    statusEl.textContent = "無法開啟鏡頭：" + e.message + "（需使用 https 或 localhost，並允許鏡頭權限）";
+    throw e;
+  }
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  video.style.transform = canvas.style.transform = facing === "user" ? "scaleX(-1)" : "none";
+}
+
+async function init() {
+  startBtn.disabled = true;
+  statusEl.textContent = "開啟鏡頭中…";
+  await startCamera();
+  if (!model) {
+    statusEl.textContent = "載入模型中…（首次約數秒）";
+    model = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+  }
+  flipBtn.disabled = false;
+  startBtn.textContent = "偵測中";
+  statusEl.textContent = "偵測中";
+  if (!running) { running = true; loop(); }
+}
+
+let last = performance.now(), fps = 0;
+async function loop() {
+  if (video.readyState >= 2) {
+    const preds = await model.detect(video, 20);
+    draw(preds);
+    const now = performance.now();
+    fps = fps * 0.9 + (1000 / (now - last)) * 0.1;
+    last = now;
+    statusEl.textContent = `偵測中　${fps.toFixed(0)} FPS`;
+  }
+  requestAnimationFrame(loop);
+}
+
+function draw(preds) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const minScore = parseFloat(thr.value);
+  const found = [];
+  ctx.lineWidth = Math.max(3, canvas.width / 240);
+  ctx.font = `${Math.max(16, canvas.width / 40)}px system-ui, sans-serif`;
+  ctx.textBaseline = "top";
+
+  for (const p of preds) {
+    if (p.score < minScore) continue;
+    const isAnimal = p.class in ANIMALS;
+    if (onlyAnimals.checked && !isAnimal) continue;
+    const name = ANIMALS[p.class] || p.class;
+    const label = `${name} ${Math.round(p.score * 100)}%`;
+    const [x, y, w, h] = p.bbox;
+    const color = isAnimal ? "#4caf50" : "#ffb300";
+
+    ctx.strokeStyle = color;
+    ctx.strokeRect(x, y, w, h);
+
+    const tw = ctx.measureText(label).width + 12;
+    const th = parseInt(ctx.font) + 8;
+    const ly = y - th < 0 ? y : y - th;
+    ctx.fillStyle = color;
+    ctx.fillRect(x, ly, tw, th);
+    ctx.fillStyle = "#000";
+
+    // 鏡像時文字需翻回來
+    if (facing === "user") {
+      ctx.save();
+      ctx.translate(x + tw / 2, 0);
+      ctx.scale(-1, 1);
+      ctx.fillText(label, -tw / 2 + 6, ly + 4);
+      ctx.restore();
+    } else {
+      ctx.fillText(label, x + 6, ly + 4);
+    }
+    if (isAnimal) found.push(label);
+  }
+  listEl.innerHTML = found.length
+    ? "🐾 " + found.join("　")
+    : "<span style='color:#777'>畫面中沒有偵測到動物</span>";
+}
+
+startBtn.addEventListener("click", () => init().catch(e => { startBtn.disabled = false; console.error(e); }));
+flipBtn.addEventListener("click", async () => {
+  facing = facing === "environment" ? "user" : "environment";
+  await startCamera();
+});
+</script>
+</body>
+</html>
