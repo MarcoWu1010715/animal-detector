@@ -11,17 +11,25 @@
   header { padding: 12px 16px; font-size: 18px; font-weight: 600; }
   #stage { position: relative; width: 100%; max-width: 720px; margin: 0 auto; background: #000; aspect-ratio: 4/3; }
   video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
-  #controls { max-width: 720px; margin: 0 auto; padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  #controls { max-width: 720px; margin: 0 auto; padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
   button { background: #2e7d32; color: #fff; border: 0; border-radius: 8px; padding: 10px 16px; font-size: 15px; }
   button.secondary { background: #333; }
   button:disabled { opacity: .5; }
+  select { background: #222; color: #eee; border: 1px solid #444; border-radius: 8px; padding: 9px 10px; font-size: 15px; max-width: 100%; }
   label { font-size: 14px; display: flex; align-items: center; gap: 6px; }
+  #modeRow { width: 100%; }
+  #modeHint { width: 100%; font-size: 13px; color: #888; }
   #status { max-width: 720px; margin: 0 auto; padding: 0 16px 8px; font-size: 14px; color: #9ad; min-height: 1.4em; }
   #list { max-width: 720px; margin: 0 auto; padding: 0 16px 24px; font-size: 16px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row .name { flex: 0 0 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .bar { flex: 1; height: 10px; background: #2a2a2a; border-radius: 5px; overflow: hidden; }
+  .row .bar > i { display: block; height: 100%; background: #4caf50; }
+  .row .pct { width: 3.2em; text-align: right; font-size: 14px; color: #aaa; }
 </style>
 </head>
 <body>
-<header>🐾 鏡頭動物偵測</header>
+<header>🐾 鏡頭動物偵測 <span id="ver" style="font-size:12px;font-weight:400;color:#888;margin-left:6px"></span></header>
 
 <div id="stage">
   <video id="video" playsinline muted></video>
@@ -29,38 +37,59 @@
 </div>
 
 <div id="controls">
+  <div id="modeRow">
+    <select id="mode">
+      <option value="coco">模型 1：COCO-SSD（框選，10 種動物）</option>
+      <option value="mobilenet">模型 2：MobileNet（分類，約 400 種動物）</option>
+      <option value="both">模型 1 + 2：框選後再辨識品種</option>
+    </select>
+  </div>
+  <div id="modeHint"></div>
   <button id="startBtn">開啟鏡頭</button>
   <button id="flipBtn" class="secondary" disabled>切換前後鏡頭</button>
   <label>信心門檻
     <input id="thr" type="range" min="0.3" max="0.9" step="0.05" value="0.5">
     <span id="thrVal">50%</span>
   </label>
-  <label><input id="onlyAnimals" type="checkbox" checked> 只顯示動物</label>
+  <label><input id="onlyAnimals" type="checkbox" checked> 只顯示動物（框選模式）</label>
 </div>
 <div id="status">按「開啟鏡頭」開始（首次需載入模型）</div>
 <div id="list"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.1/dist/mobilenet.min.js"></script>
 <script>
 const ANIMALS = {
   bird: "鳥", cat: "貓", dog: "狗", horse: "馬", sheep: "羊",
   cow: "牛", elephant: "大象", bear: "熊", zebra: "斑馬", giraffe: "長頸鹿"
 };
+const HINTS = {
+  coco: "速度快，會框出位置，但只認得貓、狗、鳥、馬、羊、牛、大象、熊、斑馬、長頸鹿。",
+  mobilenet: "辨識 1000 類（含約 400 種動物，如魚、蛇、昆蟲、各種犬種），但只會告訴你整個畫面像什麼，不會框位置，名稱為英文。",
+  both: "先框出動物，再把每隻動物單獨交給 MobileNet 判斷品種（較耗效能）。"
+};
 
-const video = document.getElementById("video");
-const canvas = document.getElementById("overlay");
-const ctx = canvas.getContext("2d");
-const statusEl = document.getElementById("status");
-const listEl = document.getElementById("list");
-const startBtn = document.getElementById("startBtn");
-const flipBtn = document.getElementById("flipBtn");
-const thr = document.getElementById("thr");
-const thrVal = document.getElementById("thrVal");
-const onlyAnimals = document.getElementById("onlyAnimals");
+const VERSION = "1.1.0";
+const BUILD_DATE = "2026-11-16";
+// 版本紀錄：1.0.0 COCO-SSD 即時偵測；1.1.0 新增 MobileNet 與組合模式
 
-let model = null, stream = null, facing = "environment", running = false;
+const $ = id => document.getElementById(id);
+$("ver").textContent = `v${VERSION}（${BUILD_DATE}）`;
+document.title = `鏡頭動物偵測 v${VERSION}`;
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const statusEl = $("status"), listEl = $("list"), hintEl = $("modeHint");
+const startBtn = $("startBtn"), flipBtn = $("flipBtn"), modeSel = $("mode");
+const thr = $("thr"), thrVal = $("thrVal"), onlyAnimals = $("onlyAnimals");
 
+let coco = null, mobile = null;
+let stream = null, facing = "environment", running = false, loading = false;
+let refined = [], lastRefine = 0;
+const crop = document.createElement("canvas");
+crop.width = crop.height = 224;
+const cropCtx = crop.getContext("2d");
+
+hintEl.textContent = HINTS.coco;
 thr.addEventListener("input", () => thrVal.textContent = Math.round(thr.value * 100) + "%");
 
 async function startCamera() {
@@ -81,25 +110,60 @@ async function startCamera() {
   video.style.transform = canvas.style.transform = facing === "user" ? "scaleX(-1)" : "none";
 }
 
+async function ensureModels() {
+  const mode = modeSel.value;
+  loading = true;
+  modeSel.disabled = true;
+  try {
+    if (mode !== "mobilenet" && !coco) {
+      statusEl.textContent = "載入 COCO-SSD 模型中…";
+      coco = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+    }
+    if (mode !== "coco" && !mobile) {
+      statusEl.textContent = "載入 MobileNet 模型中…（約數 MB，請稍候）";
+      mobile = await mobilenet.load({ version: 2, alpha: 1.0 });
+    }
+  } catch (e) {
+    statusEl.textContent = "模型載入失敗：" + e.message + "（請確認網路可連到 cdn.jsdelivr.net 與 storage.googleapis.com）";
+    throw e;
+  } finally {
+    loading = false;
+    modeSel.disabled = false;
+  }
+}
+
 async function init() {
   startBtn.disabled = true;
   statusEl.textContent = "開啟鏡頭中…";
   await startCamera();
-  if (!model) {
-    statusEl.textContent = "載入模型中…（首次約數秒）";
-    model = await cocoSsd.load({ base: "lite_mobilenet_v2" });
-  }
+  await ensureModels();
   flipBtn.disabled = false;
   startBtn.textContent = "偵測中";
-  statusEl.textContent = "偵測中";
   if (!running) { running = true; loop(); }
 }
 
+modeSel.addEventListener("change", async () => {
+  hintEl.textContent = HINTS[modeSel.value];
+  refined = [];
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  listEl.innerHTML = "";
+  if (running) { try { await ensureModels(); } catch (e) {} }
+});
+
 let last = performance.now(), fps = 0;
 async function loop() {
-  if (video.readyState >= 2) {
-    const preds = await model.detect(video, 20);
-    draw(preds);
+  if (!loading && video.readyState >= 2) {
+    const mode = modeSel.value;
+    try {
+      if (mode === "mobilenet") {
+        const cls = await mobile.classify(video, 5);
+        drawClassify(cls);
+      } else {
+        const preds = await coco.detect(video, 20);
+        if (mode === "both") await refine(preds);
+        drawBoxes(preds, mode === "both");
+      }
+    } catch (e) { console.error(e); }
     const now = performance.now();
     fps = fps * 0.9 + (1000 / (now - last)) * 0.1;
     last = now;
@@ -108,48 +172,94 @@ async function loop() {
   requestAnimationFrame(loop);
 }
 
-function draw(preds) {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+// 對動物框裁切後交給 MobileNet 判斷品種（每 0.7 秒更新，最多 3 隻）
+async function refine(preds) {
+  const now = performance.now();
+  if (now - lastRefine < 700) return;
+  lastRefine = now;
   const minScore = parseFloat(thr.value);
-  const found = [];
+  const targets = preds.filter(p => p.class in ANIMALS && p.score >= minScore).slice(0, 3);
+  const out = [];
+  for (const p of targets) {
+    const [x, y, w, h] = p.bbox;
+    cropCtx.drawImage(video, x, y, w, h, 0, 0, 224, 224);
+    const r = await mobile.classify(crop, 1);
+    if (r.length) out.push({ cx: x + w / 2, cy: y + h / 2, name: shortName(r[0].className), prob: r[0].probability });
+  }
+  refined = out;
+}
+
+function shortName(s) { return s.split(",")[0].trim(); }
+
+function findRefined(bbox) {
+  const [x, y, w, h] = bbox;
+  let best = null, bestD = Infinity;
+  for (const r of refined) {
+    if (r.cx < x || r.cx > x + w || r.cy < y || r.cy > y + h) continue;
+    const d = Math.hypot(r.cx - (x + w / 2), r.cy - (y + h / 2));
+    if (d < bestD) { bestD = d; best = r; }
+  }
+  return best;
+}
+
+function drawLabel(label, x, y, color) {
+  const tw = ctx.measureText(label).width + 12;
+  const th = parseInt(ctx.font) + 8;
+  const ly = y - th < 0 ? y : y - th;
+  ctx.fillStyle = color;
+  ctx.fillRect(x, ly, tw, th);
+  ctx.fillStyle = "#000";
+  if (facing === "user") {
+    ctx.save();
+    ctx.translate(x + tw / 2, 0);
+    ctx.scale(-1, 1);
+    ctx.fillText(label, -tw / 2 + 6, ly + 4);
+    ctx.restore();
+  } else {
+    ctx.fillText(label, x + 6, ly + 4);
+  }
+}
+
+function setupCtx() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.lineWidth = Math.max(3, canvas.width / 240);
   ctx.font = `${Math.max(16, canvas.width / 40)}px system-ui, sans-serif`;
   ctx.textBaseline = "top";
+}
 
+function drawBoxes(preds, useRefined) {
+  setupCtx();
+  const minScore = parseFloat(thr.value);
+  const found = [];
   for (const p of preds) {
     if (p.score < minScore) continue;
     const isAnimal = p.class in ANIMALS;
     if (onlyAnimals.checked && !isAnimal) continue;
-    const name = ANIMALS[p.class] || p.class;
-    const label = `${name} ${Math.round(p.score * 100)}%`;
+    let name = ANIMALS[p.class] || p.class;
+    let label = `${name} ${Math.round(p.score * 100)}%`;
+    if (useRefined && isAnimal) {
+      const r = findRefined(p.bbox);
+      if (r) label = `${name}（${r.name} ${Math.round(r.prob * 100)}%）`;
+    }
     const [x, y, w, h] = p.bbox;
     const color = isAnimal ? "#4caf50" : "#ffb300";
-
     ctx.strokeStyle = color;
     ctx.strokeRect(x, y, w, h);
-
-    const tw = ctx.measureText(label).width + 12;
-    const th = parseInt(ctx.font) + 8;
-    const ly = y - th < 0 ? y : y - th;
-    ctx.fillStyle = color;
-    ctx.fillRect(x, ly, tw, th);
-    ctx.fillStyle = "#000";
-
-    // 鏡像時文字需翻回來
-    if (facing === "user") {
-      ctx.save();
-      ctx.translate(x + tw / 2, 0);
-      ctx.scale(-1, 1);
-      ctx.fillText(label, -tw / 2 + 6, ly + 4);
-      ctx.restore();
-    } else {
-      ctx.fillText(label, x + 6, ly + 4);
-    }
+    drawLabel(label, x, y, color);
     if (isAnimal) found.push(label);
   }
   listEl.innerHTML = found.length
     ? "🐾 " + found.join("　")
     : "<span style='color:#777'>畫面中沒有偵測到動物</span>";
+}
+
+function drawClassify(cls) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  listEl.innerHTML = cls.map(c => {
+    const pct = Math.round(c.probability * 100);
+    return `<div class="row"><span class="name">${shortName(c.className)}</span>` +
+           `<span class="bar"><i style="width:${pct}%"></i></span><span class="pct">${pct}%</span></div>`;
+  }).join("");
 }
 
 startBtn.addEventListener("click", () => init().catch(e => { startBtn.disabled = false; console.error(e); }));
